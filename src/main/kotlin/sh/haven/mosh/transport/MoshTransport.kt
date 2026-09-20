@@ -76,6 +76,10 @@ class MoshTransport(
     private val receiveState = ReceiveState()         // guards client-side state advancement (#73)
     @Volatile private var serverAckedOurNum: Long = 0 // server's ack of our state
     @Volatile private var lastAckSent: Long = 0       // last ack we sent to server
+    // #421: set when a diff is skipped because the server is diffing from a
+    // state we've already passed; cleared once sendState has put our actual
+    // state back on the wire. Only our ack can correct the server's base.
+    @Volatile private var ackResendWanted: Boolean = false
     @Volatile private var lastSendTimeMs: Long = 0
 
     /** Current state number from the server; updated only when a matching-base diff is applied. */
@@ -279,6 +283,16 @@ class MoshTransport(
                     "Skipping diff: oldNum=${inst.oldNum} ≠ remoteStateNum=$remoteStateNum " +
                         "(newNum=${inst.newNum}) — waiting for retransmit with matching base",
                 )
+                // The server is ahead of us but building its diffs from a
+                // state we have already passed, so no retransmit can ever
+                // match: it has not acted on our ack of the state we're at
+                // (dkoppenh's #421 log — server retransmitting base-17 diffs
+                // at ~14/s while the client sat at 18 and sent nothing for
+                // 4.8s). Only an ack carrying our actual state moves its
+                // base, so ask the send loop for one now instead of waiting
+                // out the keepalive (3s of frozen screen per storm).
+                ackResendWanted = true
+                inputNotify.trySend(Unit)
             }
             // Counted so a sustained run of these can be told apart from an
             // idle session by the liveness check (#421).
@@ -397,6 +411,14 @@ class MoshTransport(
                     hasNewInput && elapsed >= SEND_MIN_INTERVAL_MS -> sendState()
                     // New ack to send: send soon
                     hasNewAck && elapsed >= ACK_DELAY_MS -> sendState()
+                    // #421: a skipped diff means the server is diffing from a
+                    // state we've passed — only our ack can move its base, so
+                    // resend it promptly instead of waiting for the next
+                    // keepalive (up to 3s of frozen screen per storm).
+                    ackResendWanted && elapsed >= ACK_RESEND_MS -> {
+                        ackResendWanted = false
+                        sendState()
+                    }
                     // Retransmit unacked data: back off exponentially
                     needsRetransmit && elapsed >= retransmitInterval() -> sendState()
                     // Keepalive
@@ -405,6 +427,7 @@ class MoshTransport(
                         val wait = when {
                             hasNewInput -> SEND_MIN_INTERVAL_MS - elapsed
                             hasNewAck -> ACK_DELAY_MS - elapsed
+                            ackResendWanted -> ACK_RESEND_MS - elapsed
                             needsRetransmit -> retransmitInterval() - elapsed
                             // Idle: sleep until next keepalive, woken early by inputNotify
                             else -> KEEPALIVE_INTERVAL_MS - elapsed
@@ -453,6 +476,7 @@ class MoshTransport(
             }
             lastSendTimeMs = System.currentTimeMillis()
             lastAckSent = remoteStateNum
+            ackResendWanted = false
 
             if (currentNum == lastSentNewNum && currentNum > serverAckedOurNum) {
                 retransmitCount++ // same data resent
@@ -476,6 +500,8 @@ class MoshTransport(
         const val PROTOCOL_VERSION = 2
         const val SEND_MIN_INTERVAL_MS = 20L
         const val ACK_DELAY_MS = 20L
+        /** Floor between ack resends forced by skipped diffs (#421). */
+        const val ACK_RESEND_MS = 100L
         /** Threshold after which the UI sees a non-null stall age — set to
          *  cover two missed keepalives ([KEEPALIVE_INTERVAL_MS] 3s) plus
          *  jitter so a single lost packet doesn't flicker the indicator on
