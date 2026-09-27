@@ -38,6 +38,9 @@ class MoshConnection(
     @Volatile
     private var socket: UdpSocketAdapter = socketProvider.create()
     private val socketLock = Any()
+    // Sockets swapped out by rebindSocket, kept open until the receive side is
+    // provably out of them (receiveInstruction entry / close) — see there.
+    private val retiredSockets = ArrayList<UdpSocketAdapter>()
 
     private var sendNonceSeq = 0L
     private var fragmentIdCounter = 0
@@ -121,6 +124,10 @@ class MoshConnection(
      * @return the instruction, or null on timeout
      */
     fun receiveInstruction(timeoutMs: Int): TransportInstruction? {
+        // Reclaim sockets retired by a rebind before blocking on the current
+        // one: this is the one point where the receive loop is guaranteed
+        // outside socket.receive(), so closing them cannot interrupt a read.
+        closeRetiredSockets()
         while (true) {
             val received = socket.receive(recvBuf, timeoutMs) ?: return null
 
@@ -200,14 +207,15 @@ class MoshConnection(
      * (raw UDP for direct sessions, tunneled UDP for tunneled sessions —
      * see #164).
      *
-     * Called from the send loop. Create the replacement FIRST, then swap, then
-     * close the old one. The receive loop is normally blocked in
-     * `socket.receive()` on the old socket; closing it makes that call throw
-     * (e.g. `SocketException("Socket closed")` for AndroidUdpAdapter, or an
-     * `IOException` from the bridge layer for tunneled adapters). The receive
-     * loop catches the exception, continues, and re-reads `this.socket` on the
-     * next iteration — which, because the field is @Volatile and the swap is
-     * serialized under [socketLock], is the new socket.
+     * Called from the send loop. Create the replacement FIRST, then swap. The
+     * old socket is RETIRED, not closed: the receive loop is normally blocked
+     * in `socket.receive()` on it, and closing it under that call makes the
+     * read fail with `SocketException("Socket closed")` (EBADF on Android) —
+     * the one-shot "Receive error" line the #421 reporter log showed after
+     * every rebind. A retired socket stays open so the in-flight receive
+     * times out normally; [closeRetiredSockets] reclaims it at the next
+     * [receiveInstruction] entry, when the receive side is provably no longer
+     * using it, and in [close].
      *
      * If `create()` throws — the tunnel is still flapping, or the interface
      * change isn't complete mid-roam ([sh.haven.mosh.network.UdpSocketProvider]
@@ -232,14 +240,30 @@ class MoshConnection(
             } catch (_: Exception) {
                 return
             }
-            val old = socket
+            retiredSockets.add(socket)
             socket = fresh
-            try { old.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Close sockets retired by [rebindSocket]. Called from [receiveInstruction]
+     * entry and [close] — points where the receive loop is not inside
+     * `socket.receive()`, so no in-flight read can lose its fd. Guarded by
+     * [socketLock] against a rebind racing between the sweep and the next
+     * field read.
+     */
+    private fun closeRetiredSockets() {
+        synchronized(socketLock) {
+            while (retiredSockets.isNotEmpty()) {
+                val retired = retiredSockets.removeAt(retiredSockets.size - 1)
+                try { retired.close() } catch (_: Exception) {}
+            }
         }
     }
 
     override fun close() {
         socket.close()
+        closeRetiredSockets()
         deflater.end()
         inflater.end()
     }
